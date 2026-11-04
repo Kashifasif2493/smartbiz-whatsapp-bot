@@ -1,5 +1,6 @@
 import os, re, json, hmac, hashlib, sqlite3, secrets, time, base64, logging
 from datetime import datetime
+from urllib.parse import quote
 from zoneinfo import ZoneInfo
 import requests
 from cryptography.fernet import Fernet
@@ -25,6 +26,8 @@ META_APP_SECRET = os.environ.get("META_APP_SECRET", "")
 SIGNUP_CODE = os.environ.get("SIGNUP_CODE", "")  # empty = public signup is closed
 TZ = ZoneInfo(os.environ.get("TIMEZONE", "Asia/Karachi"))
 CUR = "Rs"
+ADSENSE = os.environ.get("ADSENSE_CLIENT", "").strip()  # e.g. ca-pub-1234567890123456
+CONTACT_EMAIL = os.environ.get("CONTACT_EMAIL", "")
 if PG:
     import psycopg2, psycopg2.extras
 
@@ -82,6 +85,56 @@ def init():
         "CREATE INDEX IF NOT EXISTS ix_orders ON orders(biz,id)",
     ]:
         db(s_)
+    for t_, c_ in [("biz", "slug TEXT DEFAULT ''"), ("biz", "about TEXT DEFAULT ''"), ("biz", "btype TEXT DEFAULT 'store'"),
+                   ("prod", "unit TEXT DEFAULT ''"), ("prod", "opts TEXT DEFAULT ''"), ("prod", "descr TEXT DEFAULT ''"), ("prod", "img TEXT DEFAULT ''"), ("prod", "minq INTEGER DEFAULT 1"), ("prod", "stock INTEGER DEFAULT -1")]:
+        try:
+            db(f"ALTER TABLE {t_} ADD COLUMN {c_}")
+        except Exception:
+            pass  # column already exists
+    db("CREATE UNIQUE INDEX IF NOT EXISTS ix_slug ON biz(slug) WHERE slug<>''")
+    for r_ in db("SELECT id,name FROM biz WHERE slug='' OR slug IS NULL"):
+        db("UPDATE biz SET slug=? WHERE id=?", (uniq_slug(slugify(r_["name"]), r_["id"]), r_["id"]))
+
+
+def groups(s_):
+    """'Size: 6,8,10 | Design: Plain,Rip' -> [{'label':'Size','vals':[...]}, ...]; no colon = one group called Option"""
+    out = []
+    for part in (s_ or "").split("|"):
+        part = part.strip()
+        if not part:
+            continue
+        lab, vals = part.split(":", 1) if ":" in part else ("Option", part)
+        v = [x.strip() for x in vals.split(",") if x.strip()]
+        if v:
+            out.append({"label": lab.strip() or "Option", "vals": v})
+    return out
+
+
+def take_stock(b, items):
+    """Atomically reserve stock. Returns None if ok, or the name of an item that is short (and undoes what it took)."""
+    done = []
+    for i in items:
+        p = db("SELECT stock FROM prod WHERE id=? AND biz=?", (i["id"], b["id"]))
+        if not p or p[0]["stock"] is None or p[0]["stock"] < 0:
+            continue  # unlimited
+        if db("UPDATE prod SET stock=stock-? WHERE id=? AND biz=? AND stock>=? RETURNING id", (i["qty"], i["id"], b["id"], i["qty"])):
+            done.append(i)
+        else:
+            for d in done:
+                db("UPDATE prod SET stock=stock+? WHERE id=? AND biz=? AND stock>=0", (d["qty"], d["id"], b["id"]))
+            return i["name"]
+    return None
+
+
+def slugify(x):
+    return re.sub(r"[^a-z0-9]+", "-", x.lower()).strip("-")[:40] or "store"
+
+
+def uniq_slug(base, bid=0):
+    sl, i = base, 2
+    while db("SELECT 1 FROM biz WHERE slug=? AND id<>?", (sl, bid)):
+        sl, i = f"{base}-{i}", i + 1
+    return sl
 
 
 init()
@@ -180,13 +233,13 @@ def is_open(b):
 
 
 def avail(b):
-    return db("SELECT * FROM prod WHERE biz=? AND avail=1 ORDER BY cat,id", (b["id"],))
+    return db("SELECT * FROM prod WHERE biz=? AND avail=1 AND stock<>0 ORDER BY cat,id", (b["id"],))
 
 
 def calc(b, cart):
     items, sub = [], 0
     for c in cart:
-        p = db("SELECT * FROM prod WHERE id=? AND biz=? AND avail=1", (c["id"], b["id"]))
+        p = db("SELECT * FROM prod WHERE id=? AND biz=? AND avail=1 AND stock<>0", (c["id"], b["id"]))
         if p:
             items.append({"id": p[0]["id"], "name": p[0]["name"], "price": p[0]["price"], "qty": c["qty"]})
             sub += p[0]["price"] * c["qty"]
@@ -209,7 +262,7 @@ def menu_text(b):
         if p["cat"] != cat:
             cat = p["cat"]
             t += f"\n*{cat}*\n"
-        t += f"{n}. {p['name']} - {money(p['price'])}\n"
+        t += f"{n}. {p['name']} - {money(p['price'])}" + (f" / {p['unit']}" if p["unit"] else "") + "\n"
     return t + '\nTo order send item number and quantity, e.g. "1 x2" or "2 zinger".'
 
 
@@ -223,6 +276,9 @@ def find_p(a, txt):
     for p in a:
         if any(len(w) > 3 and w in l.split() for w in re.split(r"[\s()]+", p["name"].lower())):
             return p
+
+
+NEED = []
 
 
 def parse_items(b, t):
@@ -240,7 +296,10 @@ def parse_items(b, t):
             p = find_p(a, txt)
             q = int(nums[0]) if nums else 1
         if p and q and q > 0:
-            out.append({"id": p["id"], "qty": min(q, 50)})
+            if groups(p["opts"]):
+                NEED.append(p["name"])
+                continue
+            out.append({"id": p["id"], "qty": min(max(q, p["minq"] or 1), 50)})
     return out
 
 
@@ -283,6 +342,9 @@ def handle(b, phone, text):
     if st == "confirm":
         if has(l, "yes"):
             items, sub, fee, tot = calc(b, s["cart"])
+            short = take_stock(b, items) if items else None
+            if short:
+                return finish(f"Sorry, {short} just ran low on stock. Send CLEAR and choose again.")
             if not items:
                 reset()
                 return finish("Sorry, those items are no longer available. Please start again.")
@@ -316,7 +378,10 @@ def handle(b, phone, text):
                 return finish("Your cart is empty. Send an item number or name first.")
             s["step"] = "name"
             return finish(f"*Your cart*\n{summ(b, s['cart'])}\n\n{T['name'][L]}")
+        NEED.clear()
         it = parse_items(b, l)
+        if NEED and not it:
+            return finish(f"{', '.join(NEED)} needs a size/option choice, so please order it from our website store. I can still add other items here.")
         if it:
             for i in it:
                 e = next((c for c in s["cart"] if c["id"] == i["id"]), None)
@@ -408,7 +473,7 @@ BASE = """<!doctype html><meta name=viewport content="width=device-width,initial
 .c{background:#fff;border:1px solid #cbd9d4;border-radius:10px;padding:12px;margin:0 0 10px}input,select{width:100%;padding:10px;margin:4px 0 8px;border:1px solid #cbd9d4;border-radius:8px;font:inherit}
 button{background:#12353A;color:#fff;border:0;border-radius:8px;padding:10px 14px;font:inherit;font-weight:600}nav{display:flex;gap:8px;flex-wrap:wrap;margin-bottom:10px}
 nav a{padding:8px 12px;background:#fff;border:1px solid #cbd9d4;border-radius:8px;color:#12353A;text-decoration:none}.m{color:#4f6f6b;font-size:13px}.e{color:#C8452B}</style>
-<main>{% if b %}<nav><a href=/dash>Orders</a><a href=/menu>Menu</a><a href=/settings>Settings</a><a href=/logout>Log out</a></nav>{% endif %}
+<main>{% if b %}<nav><a href=/dash>Orders</a><a href=/menu>Menu</a><a href=/settings>Settings</a><a href="/s/{{b.slug}}" target=_blank>My store</a><a href=/logout>Log out</a></nav>{% endif %}
 {% if err %}<p class=e>{{err}}</p>{% endif %}{{body|safe}}</main>"""
 
 
@@ -427,7 +492,7 @@ def csrf():
 
 @app.before_request
 def guard():
-    if request.method == "POST" and request.endpoint != "webhook" and request.form.get("_c") != session.get("csrf"):
+    if request.method == "POST" and request.endpoint not in ("webhook", "store_order") and request.form.get("_c") != session.get("csrf"):
         abort(400)
 
 
@@ -441,7 +506,7 @@ def client_ip():
     return (request.headers.get("X-Forwarded-For", "").split(",")[0].strip() or request.remote_addr or "?")
 
 
-@app.route("/", methods=["GET", "POST"])
+@app.route("/login", methods=["GET", "POST"])
 def home():
     if request.method == "POST":
         f = request.form
@@ -453,7 +518,8 @@ def home():
                 return page(AUTH, err="Password must be at least 8 characters.", sc=True)
             if db("SELECT 1 FROM biz WHERE email=?", (em,)):
                 return page(AUTH, err="Email already registered.", sc=True)
-            db("INSERT INTO biz(email,pw,name) VALUES(?,?,?)", (em, gh(pw), f.get("name", "My Business")[:80]))
+            nm = f.get("name", "My Business")[:80]
+            db("INSERT INTO biz(email,pw,name,slug) VALUES(?,?,?,?)", (em, gh(pw), nm, uniq_slug(slugify(nm))))
             session.clear()
             session["bid"] = db("SELECT id FROM biz WHERE email=?", (em,))[0]["id"]
             return redirect("/settings")
@@ -490,7 +556,7 @@ def logout():
 def dash():
     b = me()
     if not b:
-        return redirect("/")
+        return redirect("/login")
     if request.method == "POST":
         f = request.form
         o = db("SELECT * FROM orders WHERE biz=? AND no=?", (b["id"], f["no"]))
@@ -498,6 +564,12 @@ def dash():
             if f.get("act") == "pay":
                 db("UPDATE orders SET paid=1 WHERE id=?", (o[0]["id"],))
             elif f.get("status") in ("Pending", "Accepted", "Preparing", "Dispatched", "Delivered", "Cancelled"):
+                if o[0]["status"] == "Cancelled" and f["status"] != "Cancelled":
+                    session["msg"] = f"{o[0]['no']} was cancelled and its stock was returned, so it cannot be reopened. Ask the customer to place a new order."
+                    return redirect("/dash")
+                if f["status"] == "Cancelled" and o[0]["status"] != "Cancelled":
+                    for i in json.loads(o[0]["items"]):
+                        db("UPDATE prod SET stock=stock+? WHERE id=? AND biz=? AND stock>=0", (i["qty"], i["id"], b["id"]))
                 db("UPDATE orders SET status=? WHERE id=?", (f["status"], o[0]["id"]))
                 if not wa_send(b, o[0]["phone"], f"Update: your order {o[0]['no']} is now {f['status']}."):
                     session["msg"] = f"{o[0]['no']}: status saved, but the WhatsApp update was NOT delivered (24h window passed or connection problem). Contact the customer directly."
@@ -516,39 +588,72 @@ def dash():
                 b, err=session.pop("msg", None), orders=orders, n=len(ok), sales=money(sum(o["total"] for o in ok)), inq=inq)
 
 
+def pfields(f):
+    img = f.get("img", "").strip()
+    return (f.get("name", "").strip()[:80], num(f.get("price")), f.get("cat", "").strip()[:40], f.get("unit", "").strip()[:20], f.get("opts", "").strip()[:300],
+            f.get("descr", "").strip()[:200], img[:400] if img.startswith("https://") else "", max(1, num(f.get("minq"), 1)),
+            -1 if not f.get("stock", "").strip() else num(f.get("stock")))
+
+
 @app.route("/menu", methods=["GET", "POST"])
 def menu():
     b = me()
     if not b:
-        return redirect("/")
+        return redirect("/login")
     if request.method == "POST":
         f = request.form
-        if f["act"] == "add":
-            db("INSERT INTO prod(biz,name,price,cat) VALUES(?,?,?,?)", (b["id"], f["name"][:80], num(f["price"]), f["cat"][:40]))
-        elif f["act"] == "tg":
+        act = f.get("act")
+        if act in ("add", "save"):
+            v = pfields(f)
+            if not v[0] or not v[2]:
+                session["msg"] = "Item name and category are required."
+                return redirect("/menu")
+            if act == "add":
+                db("INSERT INTO prod(biz,name,price,cat) VALUES(?,?,?,?)", (b["id"], v[0], v[1], v[2]))
+                pid = db("SELECT MAX(id) m FROM prod WHERE biz=?", (b["id"],))[0]["m"]
+            else:
+                pid = num(f.get("id"))
+                db("UPDATE prod SET name=?, price=?, cat=? WHERE id=? AND biz=?", (v[0], v[1], v[2], pid, b["id"]))
+            db("UPDATE prod SET unit=?, opts=?, descr=?, img=?, minq=?, stock=? WHERE id=? AND biz=?", (*v[3:], pid, b["id"]))
+            session["msg"] = "Item saved."
+        elif act == "tg":
             db("UPDATE prod SET avail=1-avail WHERE id=? AND biz=?", (num(f["id"]), b["id"]))
-        elif f["act"] == "price":
-            db("UPDATE prod SET price=? WHERE id=? AND biz=?", (num(f["price"]), num(f["id"]), b["id"]))
-        elif f["act"] == "del":
+        elif act == "del":
             db("DELETE FROM prod WHERE id=? AND biz=?", (num(f["id"]), b["id"]))
         return redirect("/menu")
-    return page("""<h2>Menu</h2><div class=c><form method=post><input type=hidden name=_c value="{{csrf()}}"><input type=hidden name=act value=add>
-<input name=name placeholder="Item name" required><input name=price type=number min=0 placeholder="Price" required><input name=cat placeholder="Category" required><button>Add item</button></form></div>
-{% for p in ps %}<div class=c><b>{{p.name}}</b> <span class=m>{{p.cat}} · {{'In stock' if p.avail else 'Out of stock'}}</span>
-<form method=post><input type=hidden name=_c value="{{csrf()}}"><input type=hidden name=id value="{{p.id}}"><input type=hidden name=act value=price><input name=price type=number value="{{p.price}}"><button>Update price</button></form>
-<form method=post style="display:inline"><input type=hidden name=_c value="{{csrf()}}"><input type=hidden name=id value="{{p.id}}"><button name=act value=tg>Toggle stock</button> <button name=act value=del>Remove</button></form></div>{% endfor %}""",
-                b, ps=db("SELECT * FROM prod WHERE biz=? ORDER BY cat,id", (b["id"],)))
+    ep = None
+    if request.args.get("edit"):
+        r = db("SELECT * FROM prod WHERE id=? AND biz=?", (num(request.args.get("edit")), b["id"]))
+        ep = r[0] if r else None
+    return page("""<h2>{{'Edit item' if ep else 'Menu'}}</h2><div class=c><form method=post><input type=hidden name=_c value="{{csrf()}}">
+<input type=hidden name=act value="{{'save' if ep else 'add'}}"><input type=hidden name=id value="{{ep.id if ep else ''}}">
+<label>Item name</label><input name=name required value="{{ep.name if ep else ''}}"><label>Price</label><input name=price type=number min=0 required value="{{ep.price if ep else ''}}">
+<label>Category (e.g. Patti, Rexine, Burgers)</label><input name=cat required value="{{ep.cat if ep else ''}}">
+<label>Unit (optional): dozen, meter, pair, kg, plate</label><input name=unit value="{{ep.unit if ep else ''}}">
+<label>Options (only what is available now): Size: 6,8,10 | Colour: Black,Brown</label><input name=opts value="{{ep.opts if ep else ''}}">
+<label>Short description (optional)</label><input name=descr value="{{ep.descr if ep else ''}}">
+<label>Minimum order quantity (default 1)</label><input name=minq type=number min=1 value="{{ep.minq if ep and ep.minq and ep.minq>1 else ''}}">
+<label>Stock quantity (empty = unlimited)</label><input name=stock type=number min=0 value="{{ep.stock if ep and ep.stock is not none and ep.stock>=0 else ''}}">
+<label>Photo link (optional, https://...)</label><input name=img value="{{ep.img if ep else ''}}">
+<button>{{'Save changes' if ep else 'Add item'}}</button>{% if ep %} <a href=/menu>Cancel</a>{% endif %}</form></div>
+{% for p in ps %}<div class=c><b>{{p.name}}</b> <span class=m>{{p.cat}}{% if p.unit %} · per {{p.unit}}{% endif %}{% if p.opts %} · {{p.opts}}{% endif %}{% if p.minq and p.minq>1 %} · min {{p.minq}}{% endif %}</span><br>
+{{p.price}} · <span class=m>{{'Stock: ' ~ p.stock if p.stock is not none and p.stock>=0 else 'Unlimited stock'}} · {{'Visible' if p.avail else 'Hidden (out of stock)'}}</span>
+<form method=post style="margin-top:6px"><input type=hidden name=_c value="{{csrf()}}"><input type=hidden name=id value="{{p.id}}"><a href="/menu?edit={{p.id}}" style="padding:10px 14px;display:inline-block;border:1px solid #cbd9d4;border-radius:8px;text-decoration:none;color:#12353A">Edit</a>
+<button name=act value=tg>Toggle stock</button> <button name=act value=del onclick="return confirm('Remove this item?')">Remove</button></form></div>{% endfor %}""",
+                b, err=session.pop("msg", None), ep=ep, ps=db("SELECT * FROM prod WHERE biz=? ORDER BY cat,id", (b["id"],)))
 
 
 @app.route("/settings", methods=["GET", "POST"])
 def settings():
     b = me()
     if not b:
-        return redirect("/")
+        return redirect("/login")
     err = None
     if request.method == "POST":
         f = request.form
         try:
+            db("UPDATE biz SET slug=?, btype=?, about=? WHERE id=?", (uniq_slug(slugify(f.get("slug") or b["name"]), b["id"]),
+               f.get("btype") if f.get("btype") in ("restaurant", "store", "shoes", "clothing", "grocery", "salon") else "store", f.get("about", "")[:300], b["id"]))
             for k in ["name", "addr", "owner_phone", "opens", "closes", "welcome"]:
                 db(f"UPDATE biz SET {k}=? WHERE id=?", (f.get(k, "")[:300], b["id"]))
             for k in ["fee", "free_above"]:
@@ -564,7 +669,10 @@ def settings():
     return page("""<h2>Settings</h2><div class=c><b>Webhook URL (same for every business)</b><br><code>{{url}}</code><br>
 <span class=m>Verify token = the VERIFY_TOKEN value in your server variables.</span><br><b>WhatsApp status:</b> {{b.wa_status}}</div>
 <form class=c method=post><input type=hidden name=_c value="{{csrf()}}">
-<label>Business name</label><input name=name value="{{b.name}}"><label>Address</label><input name=addr value="{{b.addr}}">
+<label>Business name</label><input name=name value="{{b.name}}">
+<label>Store link name (letters, numbers, dashes)</label><input name=slug value="{{b.slug}}"><span class=m>Your public store: {{url.replace('/webhook','')}}/s/{{b.slug}}</span>
+<label>Business type</label><select name=btype>{% for t in ['restaurant','store','shoes','clothing','grocery','salon'] %}<option {{'selected' if t==b.btype}}>{{t}}</option>{% endfor %}</select>
+<label>Short description for Google (max 300 characters)</label><input name=about value="{{b.about}}"><label>Address</label><input name=addr value="{{b.addr}}">
 <label>Owner WhatsApp (country code, digits only, e.g. 923001234567)</label><input name=owner_phone value="{{b.owner_phone}}">
 <label>Opens</label><input type=time name=opens value="{{b.opens}}"><label>Closes</label><input type=time name=closes value="{{b.closes}}">
 <label>Delivery fee</label><input type=number name=fee value="{{b.fee}}"><label>Free delivery from</label><input type=number name=free_above value="{{b.free_above}}">
@@ -574,5 +682,230 @@ def settings():
 <button>Save</button></form>""", b, err=err, url=request.host_url.rstrip("/").replace("http://", "https://") + "/webhook")
 
 
+
+# ---------------- public website: landing, stores, SEO ----------------
+def base_url():
+    return request.host_url.rstrip("/").replace("http://", "https://")
+
+
+def adsense_tag():
+    return f'<script async src="https://pagead2.googlesyndication.com/pagead/js/adsbygoogle.js?client={ADSENSE}" crossorigin="anonymous"></script>' if ADSENSE else ""
+
+
+PUB = """<!doctype html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>{{title}}</title><meta name="description" content="{{desc}}"><link rel="canonical" href="{{url}}">
+<meta property="og:type" content="website"><meta property="og:title" content="{{title}}"><meta property="og:description" content="{{desc}}"><meta property="og:url" content="{{url}}">
+<meta name="twitter:card" content="summary">{% if noindex %}<meta name="robots" content="noindex,follow">{% endif %}
+{% if ld %}<script type="application/ld+json">{{ld|tojson}}</script>{% endif %}{{ads|safe}}
+<style>:root{--ink:#14201e;--mut:#5c6f6a;--bg:#f3f6f4;--card:#fff;--ac:#0f5a52;--ac2:#e0f0ec;--line:#d5e0dc}
+@media(prefers-color-scheme:dark){:root{--ink:#e8f1ee;--mut:#9bb3ac;--bg:#0c1715;--card:#13241f;--ac:#5fd0bf;--ac2:#17332d;--line:#244039}}
+*{box-sizing:border-box}body{margin:0;background:var(--bg);color:var(--ink);font:16px/1.6 system-ui,-apple-system,"Segoe UI",Roboto,sans-serif}
+main{max-width:860px;margin:auto;padding:20px 16px 60px}h1,h2{font-family:Georgia,"Times New Roman",serif;line-height:1.15}h1{font-size:clamp(30px,6vw,46px);margin:.2em 0}
+a{color:var(--ac)}.btn{display:inline-block;background:var(--ac);color:var(--bg);padding:12px 18px;border-radius:999px;font-weight:700;text-decoration:none}
+.g{display:grid;gap:12px;grid-template-columns:repeat(auto-fit,minmax(220px,1fr))}.c{background:var(--card);border:1px solid var(--line);border-radius:16px;padding:16px}
+footer{border-top:1px solid var(--line);margin-top:40px;padding-top:14px;color:var(--mut);font-size:14px}.m{color:var(--mut)}</style></head><body><main>{{body|safe}}
+<footer><a href=/>SmartBiz</a> · <a href=/about>About</a> · <a href=/privacy>Privacy Policy</a> · <a href=/login>Business login</a></footer></main></body></html>"""
+
+
+def pub(body, title, desc, path="/", ld=None, noindex=False, ads=True):
+    return R(PUB, body=body, title=title, desc=desc, url=base_url() + path, ld=ld, noindex=noindex, ads=adsense_tag() if ads else "")
+
+
+@app.route("/")
+def landing():
+    body = """<p class=m>SmartBiz · online ordering for local shops</p><h1>Give your shop its own<br>order-taking website.</h1>
+<p style="font-size:18px;max-width:560px">Customers browse your menu or catalogue, pick what they want and send an order. You see it in your dashboard and confirm it on WhatsApp. No coding, no app to install.</p>
+<p><a class=btn href=/login>Business login</a></p>
+<div class=g><div class=c><h2 style="font-size:20px">Restaurants</h2>Menu, categories and add-ons, with delivery fee and free-delivery rules.</div>
+<div class=c><h2 style="font-size:20px">Material and general stores</h2>Items sold by pair, meter, kg or piece, with size and colour options.</div>
+<div class=c><h2 style="font-size:20px">Every shop separate</h2>Each business has its own link, products, orders and customers.</div></div>
+<h2>How it works</h2><div class=g><div class=c><b>1. Add your items</b><br>Names, prices, photos and stock status.</div><div class=c><b>2. Share your link</b><br>Put it on Facebook, Instagram and your WhatsApp status.</div><div class=c><b>3. Receive orders</b><br>Each order gets a number and appears in your dashboard.</div></div>"""
+    ld = {"@context": "https://schema.org", "@type": "WebSite", "name": "SmartBiz", "url": base_url() + "/"}
+    return pub(body, "SmartBiz: online ordering website for shops and restaurants", "Create an online store link for your restaurant, shoe material store or general store. Customers order, you manage orders from a simple dashboard.", "/", ld)
+
+
+@app.route("/about")
+def about():
+    return pub("<h1>About SmartBiz</h1><p>SmartBiz helps small shops and restaurants take orders online without building a website. Every business gets its own store page and a dashboard to manage menu, stock and orders.</p><p>Payment and delivery are handled directly between the customer and the shop.</p>" +
+               (f"<p>Contact: {CONTACT_EMAIL}</p>" if CONTACT_EMAIL else ""), "About SmartBiz", "About SmartBiz, an online ordering platform for local shops and restaurants.", "/about")
+
+
+@app.route("/privacy")
+def privacy():
+    return pub("""<h1>Privacy Policy</h1><p>When you place an order on a store page we collect your name, phone number, delivery address and the items you order. This is used only so the shop can prepare, confirm and deliver your order, and to show your order status.</p>
+<p>Order details are stored securely and are visible only to the shop you ordered from and the platform administrator. We do not sell your data.</p>
+<p>This website may show Google AdSense advertisements. Google and its partners may use cookies to show ads based on your visits to this and other sites. You can manage ad personalisation at adssettings.google.com.</p>
+<p>To ask for your order data to be deleted, contact the shop or write to us""" + (f" at {CONTACT_EMAIL}" if CONTACT_EMAIL else "") + ".</p>", "Privacy Policy | SmartBiz", "How SmartBiz collects and uses order information.", "/privacy")
+
+
+@app.route("/robots.txt")
+def robots():
+    return f"User-agent: *\nAllow: /\nDisallow: /dash\nDisallow: /menu\nDisallow: /settings\nDisallow: /webhook\nDisallow: /login\nSitemap: {base_url()}/sitemap.xml\n", 200, {"Content-Type": "text/plain"}
+
+
+@app.route("/ads.txt")
+def ads_txt():
+    return (f"google.com, {ADSENSE.replace('ca-', '')}, DIRECT, f08c47fec0942fa0\n" if ADSENSE else ""), 200, {"Content-Type": "text/plain"}
+
+
+@app.route("/sitemap.xml")
+def sitemap():
+    u = [base_url() + p for p in ("/", "/about", "/privacy")] + [f"{base_url()}/s/{r['slug']}" for r in db("SELECT slug FROM biz WHERE slug<>''")]
+    return '<?xml version="1.0" encoding="UTF-8"?><urlset xmlns="http://www.sitemaps.org/schemas/sitemap/0.9">' + "".join(f"<url><loc>{x}</loc></url>" for x in u) + "</urlset>", 200, {"Content-Type": "application/xml"}
+
+
+STORE = """<!doctype html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>{{title}}</title><meta name="description" content="{{desc}}"><link rel="canonical" href="{{url}}">
+<meta property="og:type" content="website"><meta property="og:title" content="{{title}}"><meta property="og:description" content="{{desc}}"><meta property="og:url" content="{{url}}"><meta property="og:site_name" content="{{b.name}}">
+{% if img %}<meta property="og:image" content="{{img}}">{% endif %}<meta name="twitter:card" content="summary">
+<script type="application/ld+json">{{ld|tojson}}</script>
+<style>:root{--h:{{hue}};--ac:hsl(var(--h) 60% 30%);--ac2:hsl(var(--h) 55% 92%);--ink:#17201f;--mut:#5d6f6b;--bg:#f6f4ef;--card:#fff;--line:#ddd8cc}
+@media(prefers-color-scheme:dark){:root{--ac:hsl(var(--h) 65% 68%);--ac2:hsl(var(--h) 35% 17%);--ink:#eef2f0;--mut:#a3b5b0;--bg:#101614;--card:#172220;--line:#2a3a36}}
+*{box-sizing:border-box}body{margin:0;background:var(--bg);color:var(--ink);font:16px/1.5 system-ui,-apple-system,"Segoe UI",Roboto,sans-serif}
+header{background:var(--ac);color:var(--bg);padding:26px 16px 22px}@media(prefers-color-scheme:dark){header{color:#0b1210}}
+.w{max-width:900px;margin:auto}h1{font:700 clamp(28px,6vw,44px)/1.1 Georgia,"Times New Roman",serif;margin:6px 0}
+.badge{display:inline-block;padding:3px 12px;border-radius:999px;background:rgba(255,255,255,.22);font-size:13px;font-weight:700}
+.about{max-width:620px;opacity:.95;margin:6px 0 0}#chips{display:flex;gap:8px;overflow-x:auto;padding:14px 16px;max-width:900px;margin:auto}
+.chip{border:1px solid var(--line);background:var(--card);color:var(--ink);border-radius:999px;padding:8px 16px;white-space:nowrap;font:inherit;font-weight:600}.chip.on{background:var(--ac);color:var(--bg);border-color:var(--ac)}
+#grid{display:grid;gap:14px;grid-template-columns:repeat(auto-fill,minmax(158px,1fr));padding:4px 16px 120px;max-width:900px;margin:auto}
+.card{background:var(--card);border:1px solid var(--line);border-radius:18px;padding:12px;display:flex;flex-direction:column;gap:6px}
+.card img,.mono{width:100%;aspect-ratio:16/10;object-fit:cover;border-radius:12px}.mono{display:grid;place-items:center;background:var(--ac2);color:var(--ac);font:700 40px Georgia,serif}
+.card h3{margin:2px 0 0;font-size:16px;line-height:1.25}.card p{margin:0;color:var(--mut);font-size:14px}.pr{font-weight:800;font-size:18px}.pr small{font-weight:400;color:var(--mut)}
+select,input,textarea{width:100%;padding:11px;border:1px solid var(--line);border-radius:10px;background:var(--bg);color:var(--ink);font:inherit}
+button.add,button.go{background:var(--ac);color:var(--bg);border:0;border-radius:12px;padding:11px;font:700 15px inherit;margin-top:auto}.sold{color:#b3392b;font-weight:700}.low{color:#b3392b;font-size:13px}.mut{color:var(--mut)}
+#bar{position:fixed;left:12px;right:12px;bottom:12px;max-width:876px;margin:auto;background:var(--ac);color:var(--bg);border:0;border-radius:16px;padding:16px;font:700 16px inherit;box-shadow:0 8px 24px rgba(0,0,0,.25)}
+#sheet{position:fixed;inset:0;background:rgba(0,0,0,.5);display:none;align-items:flex-end;justify-content:center;z-index:9}#sheet.on{display:flex}
+#panel{background:var(--bg);width:100%;max-width:560px;max-height:92vh;overflow:auto;border-radius:22px 22px 0 0;padding:18px}
+.line{display:flex;justify-content:space-between;gap:8px;padding:8px 0;border-bottom:1px dashed var(--line)}.q button{width:30px;height:30px;border-radius:8px;border:1px solid var(--line);background:var(--card);color:var(--ink);font-weight:700}
+.tk{background:var(--card);border:2px dashed var(--ac);border-radius:16px;padding:16px;text-align:center}.hp{position:absolute;left:-9999px}label{font-size:13px;color:var(--mut)}
+footer{max-width:900px;margin:0 auto;padding:0 16px 100px;color:var(--mut);font-size:13px}footer a{color:var(--mut)}</style></head><body>
+<header><div class=w><span class=badge>{{'Open now' if is_open else 'Closed now'}} · {{b.opens}}–{{b.closes}}</span><h1>{{b.name}}</h1>{% if b.about %}<p class=about>{{b.about}}</p>{% endif %}{% if b.addr %}<p class=about>📍 {{b.addr}}</p>{% endif %}</div></header>
+<div id=chips></div><div id=grid></div><footer>Order online from {{b.name}}. Payment and delivery are arranged directly with the shop. <a href="/s/{{b.slug}}/track">Track an order</a> · <a href=/privacy>Privacy</a> · Powered by <a href=/>SmartBiz</a></footer>
+<button id=bar hidden></button><div id=sheet><div id=panel></div></div>
+<script type="application/json" id=d>{{data|tojson}}</script>
+<script>
+const $=s=>document.querySelector(s),D=JSON.parse($('#d').textContent),C={};let cat='All';
+const esc=s=>String(s??'').replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c])),M=n=>D.cur+' '+n.toLocaleString('en-US');
+function draw(){const cs=['All',...new Set(D.prods.map(p=>p.cat))];$('#chips').innerHTML=cs.map(c=>`<button class="chip ${c==cat?'on':''}" data-c="${esc(c)}">${esc(c)}</button>`).join('');
+$('#grid').innerHTML=D.prods.filter(p=>cat=='All'||p.cat==cat).map(p=>`<article class=card>${p.img?`<img src="${esc(p.img)}" alt="${esc(p.name)}" loading=lazy>`:`<div class=mono>${esc(p.name[0])}</div>`}<h3>${esc(p.name)}</h3>${p.descr?`<p>${esc(p.descr)}</p>`:''}<div class=pr>${M(p.price)}${p.unit?`<small> / ${esc(p.unit)}</small>`:''}</div>${p.avail?`${p.groups.map((g,i)=>`<label>${esc(g.label)}</label><select id=o${p.id}_${i}>${g.vals.map(o=>`<option>${esc(o)}</option>`).join('')}</select>`).join('')}${p.minq>1?`<small class=mut>Minimum ${p.minq}${p.unit?' '+esc(p.unit):''}</small>`:''}${p.stock>=0&&p.stock<=5?`<small class=low>Only ${p.stock} left</small>`:''}<button class=add data-a=${p.id}>Add to order</button>`:'<span class=sold>Sold out</span>'}</article>`).join('');bar()}
+function tot(){let s=0,n=0;for(const k in C){s+=C[k].p.price*C[k].q;n+=C[k].q}const fee=n&&!(D.free>0&&s>=D.free)?D.fee:0;return{s,n,fee,t:s+fee}}
+function bar(){const t=tot();$('#bar').hidden=!t.n;$('#bar').textContent=`View order · ${t.n} item${t.n>1?'s':''} · ${M(t.s)}`}
+function sheet(){const t=tot();if(!t.n){$('#sheet').classList.remove('on');return}
+$('#panel').innerHTML=`<h2 style="font-family:Georgia,serif;margin:0 0 6px">Your order</h2>${Object.entries(C).map(([k,v])=>`<div class=line><span>${esc(v.p.name)}${v.o.length?` (${esc(v.o.join(', '))})`:''}<br><small>${M(v.p.price)}${v.p.unit?' / '+esc(v.p.unit):''}</small></span><span class=q><button data-m="${esc(k)}">−</button> ${v.q} <button data-p="${esc(k)}">+</button></span></div>`).join('')}
+<div class=line><span>Subtotal</span><b>${M(t.s)}</b></div><div class=line><span>Delivery</span><b>${t.fee?M(t.fee):'Free'}</b></div><div class=line><span>Total</span><b>${M(t.t)}</b></div>
+<p style="margin:12px 0 4px"><label>Your name</label><input id=n autocomplete=name></p><p style="margin:4px 0"><label>Phone number</label><input id=ph type=tel autocomplete=tel></p><p style="margin:4px 0"><label>Delivery address</label><textarea id=ad rows=2 autocomplete=street-address></textarea></p>
+<input class=hp id=hp tabindex=-1 autocomplete=off><p id=er style="color:#b3392b;margin:4px 0"></p><button class=go style="width:100%" id=go>Place order</button><button class=chip style="width:100%;margin-top:8px" data-x=1>Keep shopping</button>`;$('#sheet').classList.add('on')}
+document.addEventListener('click',async e=>{const t=e.target,c=t.dataset;
+if(c.c){cat=c.c;draw()}else if(c.a){const p=D.prods.find(x=>x.id==c.a),o=p.groups.map((g,i)=>$('#o'+p.id+'_'+i).value),k=p.id+'|'+o.join('|'),cap=p.stock>=0?p.stock:99;C[k]=C[k]||{p,o,q:0};C[k].q=C[k].q?Math.min(cap,C[k].q+1):Math.min(cap,p.minq);bar()}
+else if(t.id=='bar')sheet();else if(c.p){const v=C[c.p];v.q=Math.min(v.p.stock>=0?v.p.stock:99,v.q+1);sheet();bar()}else if(c.m){const v=C[c.m];if(v.q-1<v.p.minq)delete C[c.m];else v.q--;sheet();bar()}
+else if(c.x||t.id=='sheet')$('#sheet').classList.remove('on');
+else if(t.id=='go'){t.disabled=true;$('#er').textContent='';try{const r=await fetch('/s/'+D.slug+'/order',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({name:$('#n').value,phone:$('#ph').value,addr:$('#ad').value,website:$('#hp').value,items:Object.values(C).map(v=>({id:v.p.id,sel:v.o,qty:v.q}))})}),j=await r.json();
+if(!r.ok){$('#er').textContent=j.error||'Something went wrong.';t.disabled=false;return}
+for(const k in C)delete C[k];bar();$('#panel').innerHTML=`<div class=tk><p style="margin:0;color:var(--mut)">Order received</p><h2 style="font-family:Georgia,serif;font-size:34px;margin:4px 0">${esc(j.no)}</h2><p>Total ${M(j.total)}. The shop will confirm your order soon. Save this number to track it.</p>${j.wa?`<a class=go style="display:block;background:var(--ac);color:var(--bg);padding:12px;border-radius:12px;text-decoration:none;font-weight:700" href="${j.wa}">Send this order on WhatsApp</a>`:''}<p><a href="/s/${D.slug}/track?no=${esc(j.no)}">Track my order</a></p></div><button class=chip style="width:100%;margin-top:10px" data-x=1>Close</button>`}catch(x){$('#er').textContent='Network problem. Please try again.';t.disabled=false}}});
+draw();
+</script></body></html>"""
+
+BT = {"restaurant": "Restaurant", "store": "Store", "shoes": "Store", "clothing": "ClothingStore", "grocery": "GroceryStore", "salon": "HealthAndBeautyBusiness"}
+
+
+def by_slug(slug):
+    r = db("SELECT * FROM biz WHERE slug=?", (slug,))
+    return r[0] if r else abort(404)
+
+
+@app.route("/s/<slug>")
+def store(slug):
+    b = by_slug(slug)
+    ps = db("SELECT * FROM prod WHERE biz=? ORDER BY cat,id", (b["id"],))
+    prods = [{"id": p["id"], "name": p["name"], "price": p["price"], "cat": p["cat"], "unit": p["unit"] or "", "descr": p["descr"] or "",
+              "img": p["img"] or "", "avail": bool(p["avail"]) and p["stock"] != 0, "groups": groups(p["opts"]),
+              "minq": p["minq"] or 1, "stock": -1 if p["stock"] is None else p["stock"]} for p in ps]
+    url = f"{base_url()}/s/{b['slug']}"
+    kind = {"restaurant": "restaurant", "shoes": "shoe store"}.get(b["btype"], b["btype"] if b["btype"] != "store" else "shop")
+    desc = (b["about"] or f"Order online from {b['name']}, a {kind}" + (f" in {b['addr']}" if b["addr"] else "") + ". See prices and place your order in a minute.")[:300]
+    node = {"@type": BT.get(b["btype"], "Store"), "@id": url + "#biz", "name": b["name"], "url": url, "description": desc,
+            "address": {"@type": "PostalAddress", "streetAddress": b["addr"] or "", "addressCountry": "PK"},
+            "openingHoursSpecification": [{"@type": "OpeningHoursSpecification", "dayOfWeek": ["Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday", "Sunday"], "opens": b["opens"], "closes": b["closes"]}]}
+    if b["owner_phone"]:
+        node["telephone"] = "+" + b["owner_phone"]
+    if prods and prods[0]["img"]:
+        node["image"] = prods[0]["img"]
+    graph = [node, {"@type": "BreadcrumbList", "itemListElement": [{"@type": "ListItem", "position": 1, "name": "SmartBiz", "item": base_url() + "/"},
+                                                                    {"@type": "ListItem", "position": 2, "name": b["name"], "item": url}]}]
+    for p in prods[:50]:
+        pr = {"@type": "Product", "name": p["name"], "category": p["cat"], "description": p["descr"] or p["name"],
+              "offers": {"@type": "Offer", "price": str(p["price"]), "priceCurrency": "PKR", "url": url, "seller": {"@id": url + "#biz"},
+                         "availability": "https://schema.org/InStock" if p["avail"] else "https://schema.org/OutOfStock"}}
+        if p["img"]:
+            pr["image"] = p["img"]
+        graph.append(pr)
+    hue = int(hashlib.md5(b["name"].encode()).hexdigest()[:4], 16) % 360
+    data = {"slug": b["slug"], "cur": CUR, "fee": b["fee"], "free": b["free_above"], "prods": prods}
+    return R(STORE, b=b, title=f"{b['name']}: order online | menu and prices"[:70], desc=desc, url=url, ld={"@context": "https://schema.org", "@graph": graph},
+             img=next((p["img"] for p in prods if p["img"]), ""), hue=hue, data=data, is_open=is_open(b))
+
+
+OH = {}
+
+
+@app.route("/s/<slug>/order", methods=["POST"])
+def store_order(slug):
+    b = by_slug(slug)
+    ip, now = client_ip(), time.time()
+    OH[ip] = [x for x in OH.get(ip, []) if now - x < 600]
+    if len(OH[ip]) >= 5:
+        return {"error": "Too many orders from this device. Please try again in a few minutes."}, 429
+    d = request.get_json(silent=True) or {}
+    if d.get("website"):
+        return {"error": "Rejected."}, 400  # honeypot for bots
+    name, phone, addr = str(d.get("name", "")).strip()[:60], re.sub(r"\D", "", str(d.get("phone", "")))[:15], str(d.get("addr", "")).strip()[:200]
+    if len(name) < 2 or len(phone) < 10 or len(addr) < 8:
+        return {"error": "Please enter your name, a valid phone number and your full address."}, 400
+    items, sub = [], 0
+    for it in (d.get("items") or [])[:50]:
+        if not isinstance(it, dict):
+            continue
+        q, p = min(num(it.get("qty")), 99), db("SELECT * FROM prod WHERE id=? AND biz=? AND avail=1 AND stock<>0", (num(it.get("id")), b["id"]))
+        if not p or q < 1:
+            continue
+        p = p[0]
+        gs, sel = groups(p["opts"]), it.get("sel") if isinstance(it.get("sel"), list) else []
+        if len(sel) != len(gs) or any(str(sel[i]) not in g["vals"] for i, g in enumerate(gs)):
+            return {"error": f"Please choose {' and '.join(g['label'] for g in gs)} for {p['name']}."}, 400
+        if q < (p["minq"] or 1):
+            return {"error": f"Minimum order for {p['name']} is {p['minq']}."}, 400
+        items.append({"id": p["id"], "name": p["name"] + (f" ({', '.join(str(x) for x in sel)})" if sel else "") + (f" [{p['unit']}]" if p["unit"] else ""), "price": p["price"], "qty": q})
+        sub += p["price"] * q
+    if not items:
+        return {"error": "Your order is empty or the items are no longer available."}, 400
+    short = take_stock(b, items)
+    if short:
+        return {"error": f"Sorry, {short} does not have enough stock for that quantity. Please reduce it."}, 400
+    fee = 0 if (b["free_above"] > 0 and sub >= b["free_above"]) else b["fee"]
+    total = sub + fee
+    no = f"SB-{db('UPDATE biz SET seq=seq+1 WHERE id=? RETURNING seq', (b['id'],))[0]['seq']}"
+    db("INSERT INTO orders(biz,no,ts,phone,name,addr,items,sub,fee,total) VALUES(?,?,?,?,?,?,?,?,?,?)", (b["id"], no, int(now), phone, name, addr, json.dumps(items), sub, fee, total))
+    OH[ip].append(now)
+    wa_send(b, b["owner_phone"], f"New website order {no}: {money(total)} from {name} ({phone}). Check your dashboard.")
+    text = f"Order {no} from {b['name']}\n" + "\n".join(f"{i['qty']} x {i['name']} = {money(i['price'] * i['qty'])}" for i in items) + \
+        f"\nDelivery: {money(fee) if fee else 'Free'}\nTotal: {money(total)}\n\nName: {name}\nPhone: {phone}\nAddress: {addr}"
+    return {"no": no, "total": total, "wa": f"https://wa.me/{b['owner_phone']}?text={quote(text)}" if b["owner_phone"] else ""}
+
+
+@app.route("/s/<slug>/track")
+def track(slug):
+    b = by_slug(slug)
+    no, ph = request.args.get("no", "").strip().upper(), re.sub(r"\D", "", request.args.get("phone", ""))
+    res = ""
+    if no and ph:
+        o = db("SELECT * FROM orders WHERE biz=? AND no=?", (b["id"], no))
+        res = (f"<div class=c><b>{R('{{n}}', n=no)}</b>: {R('{{s}}', s=o[0]['status'])}. Total {money(o[0]['total'])}. " + ("Payment verified." if o[0]["paid"] else "Payment not yet verified.") + "</div>"
+               if o and o[0]["phone"][-7:] == ph[-7:] else "<p>No order found with that number and phone.</p>")
+    body = f"""<h1>Track your order</h1><p class=m>{R('{{n}}', n=b['name'])}</p><form class=c><label>Order number</label><input name=no value="{R('{{n}}', n=no)}" placeholder="SB-1001" style="width:100%;padding:10px;margin:4px 0 10px">
+<label>Phone number used for the order</label><input name=phone type=tel style="width:100%;padding:10px;margin:4px 0 10px"><button class=btn style="border:0">Check status</button></form>{res}<p><a href="/s/{b['slug']}">Back to store</a></p>"""
+    return pub(body, f"Track order | {b['name']}", "Check the status of your order.", f"/s/{b['slug']}/track", noindex=True, ads=False)
+
+
 if __name__ == "__main__":
     app.run(host="0.0.0.0", port=int(os.environ.get("PORT", 5000)))
+      
